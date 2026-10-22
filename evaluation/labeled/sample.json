@@ -1,0 +1,10 @@
+{
+  "chat": "data/sample_chat.txt",
+  "my_aliases": ["rahul"],
+  "action_items": [
+    {"message_id": 2, "task": "Rahul sends project report by Friday"},
+    {"message_id": 3, "task": "Amit books seminar hall"},
+    {"message_id": 4, "task": "Everyone pays fee today"},
+    {"message_id": 8, "task": "Neha shares slides by Sunday"}
+  ]
+}
