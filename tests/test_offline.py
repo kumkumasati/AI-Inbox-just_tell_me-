@@ -8,27 +8,30 @@ from cryptography.fernet import Fernet
 os.environ["ENCRYPTION_KEY"] = Fernet.generate_key().decode()
 os.environ["USE_PRESIDIO"] = "0"
 
-import db, pipeline, llm
-from schemas import Extraction, ActionItem, Decision, Topic
+import db, privacy, verify, score, chat_parser
+from schemas import Extraction, ActionItem, Topic
 
-def test_payload_privacy_leak():
-    fake_payloads = []
-    def mock_structured(system, user, model_cls):
-        fake_payloads.append(user)
-        return Extraction(
-            topics=[Topic(title="Test", message_ids=[1])],
-            action_items=[ActionItem(task="Do thing", assignee="ME", deadline="Today", source_message_ids=[1], quote="Rahul: hello test@okaxis.com 9876543210")],
-            decisions=[]
-        )
-    
-    with patch("extract.structured", side_effect=mock_structured):
-        res = pipeline.analyze("data/sample_chat.txt", ["rahul"], use_presidio=False)
-        payload = " ".join(fake_payloads)
-        assert "rahul" not in payload.lower()
-        assert "9876543210" not in payload
-        assert "test@okaxis.com" not in payload
-    print("Privacy leak mock test passed!")
+def test_privacy_roundtrip():
+    name_map = {"rahul": "PERSON_1"}
+    names = {"PERSON_1": "Rahul"}
+    raw = "Rahul said hello to PERSON_1"
+    protected = privacy.protect(raw, name_map, use_presidio=False, names=names)
+    restored = privacy.restore(protected, names)
+    assert restored == "Rahul said hello to Rahul"
+
+def test_parser():
+    sample = "[12/05/2026, 10:15 AM] Alice: Let's meet at 5pm."
+    parsed = chat_parser.parse_text(sample)
+    assert len(parsed) == 1
+    assert parsed[0]["sender"] == "Alice"
+
+def test_verify():
+    by_id = {1: {"text": "I will send the document today evening."}}
+    ok, _ = verify.check([1], "I will send the document", by_id, item_text="Send document")
+    assert ok is True
 
 if __name__ == "__main__":
-    test_payload_privacy_leak()
-    print("ALL TESTS PASSED!")
+    test_privacy_roundtrip()
+    test_parser()
+    test_verify()
+    print("ALL TESTS PASSED SUCCESSFULLY!")

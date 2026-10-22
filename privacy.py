@@ -1,14 +1,17 @@
 import re
 
-EMAIL = re.compile(r"[\w\.-]+@[\w\.-]+(?:\.\w+)?")  # Catches UPI IDs like name@okaxis
+EMAIL = re.compile(r"[\w\.-]+@[\w\.-]+(?:\.\w+)?")
 URL = re.compile(r"https?://\S+")
-PHONE = re.compile(r"\+?\d[\d\s\-]{8,}\d")
-AADHAAR = re.compile(r"\b[2-9]\d{3}[\s\-]?\d{4}[\s\-]?\d{4}\b")
+
+# Tightened Indian mobile regex plus strict international formats
+PHONE = re.compile(r"(?<!\d)(?:\+?91[\s-]?)?[6-9]\d{4}[\s-]?\d{5}(?!\d)")
+INTERNATIONAL_PHONE = re.compile(r"(?<!\d)\+(?:[0-9]\s?){6,14}[0-9](?!\d)")
+
 PAN = re.compile(r"\b[A-Z]{5}\d{4}[A-Z]\b", re.I)
 BANK_ACC = re.compile(r"\b\d{9,18}\b")
 OTP = re.compile(r"\b(?i:otp|code|verification)\s*[:\-]?\s*(\d{4,8})\b")
 
-KINDS = ("PERSON", "PLACE", "PHONE", "LINK", "EMAIL", "AADHAAR", "PAN", "BANK", "OTP")
+KINDS = ("PERSON", "PLACE", "PHONE", "LINK", "EMAIL", "PAN", "BANK", "OTP")
 _KIND_ALT = "|".join(KINDS)
 PLACEHOLDER = re.compile(rf"(?:{_KIND_ALT})_\d+|ME")
 _RESTORE = re.compile(rf"\b((?:{_KIND_ALT})_\d+|ME)\b")
@@ -56,11 +59,11 @@ def pseudonymize(text, name_map):
     return pat.sub(lambda m: name_map[m.group(0).lower()], text)
 
 def regex_redact(text, names):
-    text = AADHAAR.sub(lambda m: _placeholder("AADHAAR", m.group(0), names), text)
     text = PAN.sub(lambda m: _placeholder("PAN", m.group(0), names), text)
     text = EMAIL.sub(lambda m: _placeholder("EMAIL", m.group(0), names), text)
     text = URL.sub(lambda m: _placeholder("LINK", m.group(0), names), text)
     text = PHONE.sub(lambda m: _placeholder("PHONE", m.group(0), names), text)
+    text = INTERNATIONAL_PHONE.sub(lambda m: _placeholder("PHONE", m.group(0), names), text)
     text = BANK_ACC.sub(lambda m: _placeholder("BANK", m.group(0), names), text)
     text = OTP.sub(lambda m: _placeholder("OTP", m.group(0), names), text)
     return text
@@ -74,16 +77,15 @@ def _get_analyzer():
         from presidio_analyzer.nlp_engine import NlpEngineProvider
         provider = NlpEngineProvider(nlp_configuration={
             "nlp_engine_name": "spacy",
-            "models": [{"lang_code": "en", "model_name": "en_core_web_lg"}],
+            "models": [{"lang_code": "en", "model_name": "en_core_web_sm"}],
         })
         _analyzer = AnalyzerEngine(nlp_engine=provider.create_engine(), supported_languages=["en"])
     return _analyzer
 
 def presidio_redact(text, names):
-    try:
-        results = _get_analyzer().analyze(text=text, language="en", entities=["PERSON", "LOCATION"], score_threshold=0.5)
-    except Exception:
-        return text
+    # Fail closed: will raise explicit error if Presidio engine is unavailable when enabled
+    analyzer = _get_analyzer()
+    results = analyzer.analyze(text=text, language="en", entities=["PERSON", "LOCATION"], score_threshold=0.5)
     out, limit = text, len(text)
     for r in sorted(results, key=lambda r: r.start, reverse=True):
         span = text[r.start:r.end]

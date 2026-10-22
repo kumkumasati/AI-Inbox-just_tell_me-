@@ -2,8 +2,10 @@ openai==1.42.0
 pydantic==2.8.2
 faiss-cpu==1.8.0.post1
 numpy==1.26.4
+pandas==2.2.2
 python-dotenv==1.0.1
 cryptography==43.0.0
 streamlit==1.37.1
 presidio-analyzer==2.2.354
 spacy==3.7.5
+pytest==8.3.2

@@ -1,4 +1,5 @@
 import json
+import time
 import numpy as np
 from openai import OpenAI
 from config import *
@@ -13,15 +14,21 @@ def _client():
 
 _no_temperature = set()
 
-def _call(fn, model, **kw):
-    if model not in _no_temperature:
+def _call_with_backoff(fn, **kw):
+    retries = 3
+    delay = 2.0
+    for attempt in range(retries):
         try:
-            return fn(model=model, temperature=0, **kw)
+            return fn(**kw)
         except Exception as e:
-            if "temperature" not in str(e).lower():
+            err_msg = str(e).lower()
+            if "429" in err_msg or "rate limit" in err_msg:
+                if attempt == retries - 1:
+                    raise
+                time.sleep(delay)
+                delay *= 2.0
+            else:
                 raise
-            _no_temperature.add(model)
-    return fn(model=model, **kw)
 
 def structured(system, user, model_cls):
     c = _client()
@@ -30,11 +37,22 @@ def structured(system, user, model_cls):
         if MODE == "local":
             schema = json.dumps(model_cls.model_json_schema())
             msgs[0]["content"] = system + "\nReply ONLY with JSON matching schema:\n" + schema
-            r = _call(c.chat.completions.create, LOCAL_MODEL, response_format={"type": "json_object"}, messages=msgs)
-            return model_cls.model_validate_json(r.choices[0].message.content)
+            r = _call_with_backoff(c.chat.completions.create, model=LOCAL_MODEL, response_format={"type": "json_object"}, messages=msgs)
+            raw_content = r.choices[0].message.content
+            
+            # Local JSON Repair attempt
+            try:
+                return model_cls.model_validate_json(raw_content)
+            except Exception:
+                repair_msgs = msgs + [
+                    {"role": "assistant", "content": raw_content},
+                    {"role": "user", "content": "Your output had invalid JSON syntax. Fix it and output valid JSON only."}
+                ]
+                r_fix = _call_with_backoff(c.chat.completions.create, model=LOCAL_MODEL, response_format={"type": "json_object"}, messages=repair_msgs)
+                return model_cls.model_validate_json(r_fix.choices[0].message.content)
         
-        parse = getattr(c.chat.completions, "parse", None) or c.beta.chat.completions.parse
-        r = _call(parse, OPENAI_MODEL, response_format=model_cls, messages=msgs)
+        parse_fn = getattr(c.chat.completions, "parse", None) or c.beta.chat.completions.parse
+        r = _call_with_backoff(parse_fn, model=OPENAI_MODEL, response_format=model_cls, messages=msgs)
         parsed = r.choices[0].message.parsed
         if parsed is None:
             raise LLMError("Model returned empty structured response")
@@ -55,7 +73,8 @@ def embed(texts):
                 _local_model = SentenceTransformer(LOCAL_EMBED)
             vecs = np.array(_local_model.encode(texts), dtype="float32")
         else:
-            c, out = _client(), []
+            c = _client()
+            out = []
             for i in range(0, len(texts), 256):
                 resp = c.embeddings.create(model=OPENAI_EMBED, input=texts[i:i + 256])
                 out += [d.embedding for d in resp.data]

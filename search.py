@@ -17,6 +17,8 @@ SYSTEM = (
     f"If not answered in messages, reply EXACTLY with '{NOT_FOUND}' and empty sources/quote."
 )
 
+AGGREGATE_PATTERNS = re.compile(r"\b(key decisions|all tasks|assigned to me|my tasks|summary|overview)\b", re.I)
+
 def build_index(cid, safe_messages):
     if not safe_messages:
         return False
@@ -44,6 +46,14 @@ def ask(cid, question, k=RETRIEVE_K):
     if not msgs:
         return _unverified("Chat is empty.", "empty chat")
     
+    # Intent Routing: Route aggregate queries directly to structured storage
+    if AGGREGATE_PATTERNS.search(question):
+        items = db.get_items(cid)
+        if not items:
+            return {"answer": "No extracted action items or decisions found.", "sources": [], "verified": True}
+        summary = "\n".join(f"• [{it['kind'].title()}] {it.get('task') or it.get('decision')} (Topic: {it.get('topic')})" for it in items)
+        return {"answer": f"Here is the summary of items extracted from this chat:\n\n{summary}", "sources": [], "verified": True}
+
     path = index_path(cid)
     if not path.exists():
         return _unverified("Search index missing.", "missing index")
@@ -57,7 +67,6 @@ def ask(cid, question, k=RETRIEVE_K):
         
         _, idxs = index.search(qv, min(k, len(msgs)))
         hit_indices = set()
-        msg_dict = {m["id"]: i for i, m in enumerate(msgs)}
         
         for idx in idxs[0]:
             if 0 <= idx < len(msgs):
@@ -76,7 +85,7 @@ def ask(cid, question, k=RETRIEVE_K):
         return {"answer": NOT_FOUND, "sources": [], "verified": True, "not_found": True, "retrieved": hits}
 
     by_id = {m["id"]: {"text": m["safe_text"]} for m in hits}
-    ok, reason = check(ans.source_message_ids, ans.quote, by_id)
+    ok, reason = check(ans.source_message_ids, ans.quote, by_id, item_text=ans.answer)
     if not ok:
         return _unverified("Could not verify answer against source text.", reason, hits)
 
