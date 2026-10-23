@@ -1,0 +1,26 @@
+# secrets - never bake into the image
+.env
+.env.*
+
+# git
+.git
+.gitignore
+
+# python
+venv/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# private chat data
+data/raw/
+data/indexes/
+data/*.db
+data/*.db-*
+data/*.index
+
+# not needed at runtime
+tests/
+evaluation/
+README.md

@@ -1,8 +1,23 @@
+# secrets
 .env
+.env.*
+!.env.example
+
+# python
 venv/
+.venv/
 __pycache__/
 *.pyc
+.pytest_cache/
+
+# app data (private chat content)
 data/raw/
 data/indexes/
 data/*.db
+data/*.db-*
 data/*.index
+
+# editor / OS
+.idea/
+.vscode/
+.DS_Store
