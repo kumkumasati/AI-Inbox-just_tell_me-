@@ -1,11 +1,17 @@
+# Python 3.11 or 3.12 required (numpy 1.26 / faiss-cpu 1.8 / spacy 3.7 have no wheels for 3.13+)
 openai==1.42.0
+# httpx>=0.28 breaks openai<1.55 ("unexpected keyword argument 'proxies'") - keep this pin
+httpx==0.27.2
 pydantic==2.8.2
 faiss-cpu==1.8.0.post1
 numpy==1.26.4
+# pyarrow>=18 needs NumPy 2 and crashes st.dataframe / st.bar_chart with numpy 1.26
+pyarrow==17.0.0
 pandas==2.2.2
 python-dotenv==1.0.1
 cryptography==43.0.0
-streamlit==1.37.1
+# st.container(key=...) used by the UI needs Streamlit >= 1.39
+streamlit==1.40.2
 presidio-analyzer==2.2.354
 spacy==3.7.5
-pytest==8.3.2
+en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl

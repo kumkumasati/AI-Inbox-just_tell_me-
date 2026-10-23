@@ -1,58 +1,54 @@
 import json
-import time
+from functools import lru_cache
+
 import numpy as np
 from openai import OpenAI
-from config import *
+
+from config import (LLM_TIMEOUT, LOCAL_EMBED, LOCAL_MODEL, LOCAL_URL, MODE,
+                    OPENAI_EMBED, OPENAI_MODEL)
 
 class LLMError(RuntimeError):
     pass
 
+@lru_cache(maxsize=1)
 def _client():
+   
     if MODE == "local":
         return OpenAI(base_url=LOCAL_URL, api_key="ollama", timeout=LLM_TIMEOUT, max_retries=2)
     return OpenAI(timeout=LLM_TIMEOUT, max_retries=3)
 
-_no_temperature = set()
-
-def _call_with_backoff(fn, **kw):
-    retries = 3
-    delay = 2.0
-    for attempt in range(retries):
-        try:
-            return fn(**kw)
-        except Exception as e:
-            err_msg = str(e).lower()
-            if "429" in err_msg or "rate limit" in err_msg:
-                if attempt == retries - 1:
-                    raise
-                time.sleep(delay)
-                delay *= 2.0
-            else:
-                raise
+def _create_deterministic(fn, **kwargs):
+    """temperature=0 for reproducible extraction; retry without it for models that reject it."""
+    try:
+        return fn(temperature=0, **kwargs)
+    except Exception as e:
+        if "temperature" in str(e).lower():
+            return fn(**kwargs)
+        raise
 
 def structured(system, user, model_cls):
-    c = _client()
     msgs = [{"role": "system", "content": system}, {"role": "user", "content": user}]
     try:
+        c = _client()
         if MODE == "local":
             schema = json.dumps(model_cls.model_json_schema())
             msgs[0]["content"] = system + "\nReply ONLY with JSON matching schema:\n" + schema
-            r = _call_with_backoff(c.chat.completions.create, model=LOCAL_MODEL, response_format={"type": "json_object"}, messages=msgs)
+            r = _create_deterministic(c.chat.completions.create, model=LOCAL_MODEL, response_format={"type": "json_object"}, messages=msgs)
             raw_content = r.choices[0].message.content
-            
-            # Local JSON Repair attempt
+
+
             try:
                 return model_cls.model_validate_json(raw_content)
             except Exception:
                 repair_msgs = msgs + [
                     {"role": "assistant", "content": raw_content},
-                    {"role": "user", "content": "Your output had invalid JSON syntax. Fix it and output valid JSON only."}
+                    {"role": "user", "content": "Your output had invalid JSON syntax. Fix it and output valid JSON only."},
                 ]
-                r_fix = _call_with_backoff(c.chat.completions.create, model=LOCAL_MODEL, response_format={"type": "json_object"}, messages=repair_msgs)
+                r_fix = _create_deterministic(c.chat.completions.create, model=LOCAL_MODEL, response_format={"type": "json_object"}, messages=repair_msgs)
                 return model_cls.model_validate_json(r_fix.choices[0].message.content)
-        
+
         parse_fn = getattr(c.chat.completions, "parse", None) or c.beta.chat.completions.parse
-        r = _call_with_backoff(parse_fn, model=OPENAI_MODEL, response_format=model_cls, messages=msgs)
+        r = _create_deterministic(parse_fn, model=OPENAI_MODEL, response_format=model_cls, messages=msgs)
         parsed = r.choices[0].message.parsed
         if parsed is None:
             raise LLMError("Model returned empty structured response")

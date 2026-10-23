@@ -4,9 +4,18 @@ from functools import lru_cache
 from cryptography.fernet import Fernet
 from config import DB_PATH, ENCRYPTION_KEY, index_path
 
+KEY_HELP = ('python -c "from cryptography.fernet import Fernet; '
+            'print(Fernet.generate_key().decode())"')
+
 @lru_cache(maxsize=4)
 def _fernet_for(key: str):
-    return Fernet(key.encode())
+    try:
+        return Fernet(key.encode())
+    except Exception as e:
+        # Friendly message instead of a raw cryptography traceback
+        raise RuntimeError(
+            "ENCRYPTION_KEY is invalid (it must be a 44-character Fernet key). "
+            f"Generate one with:  {KEY_HELP}") from e
 
 def _fernet():
     return _fernet_for(ENCRYPTION_KEY)
@@ -16,6 +25,13 @@ def enc(s: str) -> str:
 
 def dec(s: str) -> str:
     return _fernet().decrypt(s.encode()).decode()
+
+# BUG FIX #22: used to encrypt the FAISS index file on disk
+def enc_bytes(b: bytes) -> bytes:
+    return _fernet().encrypt(b)
+
+def dec_bytes(b: bytes) -> bytes:
+    return _fernet().decrypt(b)
 
 @contextmanager
 def _conn():
@@ -27,7 +43,8 @@ def _conn():
 
 def init():
     if not ENCRYPTION_KEY:
-        raise RuntimeError("ENCRYPTION_KEY is not set. Refusing unencrypted run.")
+        raise RuntimeError(f"ENCRYPTION_KEY is not set. Refusing unencrypted run. "
+                           f"Generate one with:  {KEY_HELP}  and put it in .env")
     _fernet()
     with _conn() as c:
         c.execute("CREATE TABLE IF NOT EXISTS chats(chat_id TEXT PRIMARY KEY, name TEXT, created REAL, privacy_enc TEXT)")

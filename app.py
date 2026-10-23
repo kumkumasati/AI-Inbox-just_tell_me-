@@ -1,36 +1,36 @@
-"""AI-Inbox — upgraded six-screen UI.
+"""AI-Inbox - six-screen UI.
 Run: streamlit run app.py
 
-Keeps the existing project interfaces:
+Backend interfaces used:
   db.init / purge_old / list_chats / get_messages / get_items / delete_chat
   search.ask(chat_id, question)
-  pipeline.run_pipeline(path, chat_name, aliases)
-  config constants: MODE, RETENTION_DAYS, RAW_DIR
+  pipeline.process(path, chat_name, aliases)
+  config constants: MODE, RETENTION_DAYS, RAW_DIR, APP_PASSWORD
 """
-import html
+import hmac
 import os
-import re
 import time
+import uuid
 from collections import Counter
-from datetime import datetime
 
 import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components
 
 import db
+import score
 import search
-from config import *
-from pipeline import run_pipeline
+from config import (APP_PASSWORD, MAX_UPLOAD_MB, MODE, RAW_DIR, RETENTION_DAYS,
+                    USE_PRESIDIO)
+from pipeline import process
+from ui_utils import esc, highlight, placeholder_alternatives
 
 st.set_page_config(page_title="AI-Inbox", page_icon="📥", layout="wide")
 
 # ---------------------------- Visual system ----------------------------
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
 :root { --violet:#8b7cff; --cyan:#22b8f0; --mint:#35d6a1; --muted:#9ba8c9; }
-html, body, [class*="css"], button, input, textarea {font-family:Inter,'Segoe UI',sans-serif;}
+html, body, [class*="css"], button, input, textarea {font-family:'Segoe UI',Inter,system-ui,-apple-system,sans-serif;}
 .stApp { color:#edf0fb; background:
  radial-gradient(1000px 500px at 10% -8%,rgba(124,108,255,.32),transparent 62%),
  radial-gradient(900px 480px at 98% 0%,rgba(34,184,240,.18),transparent 58%), #0a0e1e; }
@@ -90,40 +90,41 @@ hr{border-color:rgba(255,255,255,.09)}
 </style>
 """, unsafe_allow_html=True)
 
+# ---------------------------- Optional login gate ----------------------------
+def require_login():
+    """Shown only when APP_PASSWORD is set (use it for any public deployment)."""
+    if not APP_PASSWORD or st.session_state.get("authed"):
+        return
+    st.markdown("### 🔒 AI-Inbox")
+    pw = st.text_input("Password", type="password", key="login_pw")
+    if pw:
+        if hmac.compare_digest(pw.encode(), APP_PASSWORD.encode()):
+            st.session_state["authed"] = True
+            st.rerun()
+        else:
+            st.error("Wrong password")
+    st.stop()
+
+require_login()
+
 PALETTE = ["#7C6CFF", "#22B8F0", "#2ED3A0", "#FFB020", "#FF5C6C", "#A855F7"]
 
-def esc(value):
-    return html.escape(str(value)).replace("\n", "<br>")
-
-def priority(score):
-    if score >= 6:
+def priority(score_value):
+    if score_value >= 6:
         return "high", "High"
-    if score >= 3:
+    if score_value >= 3:
         return "medium", "Medium"
     return "low", "Low"
 
-def bubbles(messages, quote=None):
+ACTIVE_ALTS = {}   
+
+def bubbles(messages, quote=None, quote_safe=None):
     """Render message bubbles, highlighting the exact quote if provided."""
     for m in messages:
-        text = m.get("text", "")
-        if quote and quote.strip():
-            try:
-                pattern = re.compile(re.escape(quote.strip()), re.IGNORECASE)
-                match = pattern.search(text)
-                if match:
-                    matched_str = match.group(0)
-                    text = pattern.sub(f"<mark>{html.escape(matched_str)}</mark>", text)
-                else:
-                    text = html.escape(text).replace("\n", "<br>")
-            except Exception:
-                text = html.escape(text).replace("\n", "<br>")
-        else:
-            text = html.escape(text).replace("\n", "<br>")
-
         st.markdown(
             f"<div class='bubble'><span class='who'>{esc(m.get('sender','Unknown'))}</span>"
             f"<span class='ts'>#{esc(m.get('id',''))} · {esc(m.get('timestamp',''))}</span>"
-            f"<div>{text}</div></div>",
+            f"<div>{highlight(m.get('text', ''), quote, quote_safe, ACTIVE_ALTS)}</div></div>",   
             unsafe_allow_html=True,
         )
 
@@ -182,7 +183,7 @@ def render_items(rows, messages, show_source=True):
             with st.expander(f"View source messages · {index + 1}", expanded=False):
                 found = [messages[mid] for mid in source_ids if mid in messages]
                 if found:
-                    bubbles(found, quote=item.get("quote"))
+                    bubbles(found, quote=item.get("quote"), quote_safe=item.get("quote_safe"))
                 else:
                     st.caption("No source messages are available for this item.")
 
@@ -190,42 +191,45 @@ def page_header(title, subtitle):
     st.markdown(f"<div class='page-head'><h1>{esc(title)}</h1><span>{esc(subtitle)}</span></div>", unsafe_allow_html=True)
 
 # ---------------------------- Backend state ----------------------------
-db.init()
-db.purge_old(RETENTION_DAYS)
+@st.cache_resource(ttl=600, show_spinner=False)
+def _maintenance():
+    """Create tables and purge expired chats - at most once per 10 minutes, not on every click."""
+    db.init()
+    return db.purge_old(RETENTION_DAYS)
+
+try:
+    _maintenance()
+except RuntimeError as exc:
+    st.error(str(exc))
+    st.stop()
 
 if st.session_state.pop("_reset_chat", False):
     st.session_state.pop("chat", None)
+@st.cache_data(ttl=300, show_spinner=False, max_entries=8)
+def _load_chat(chat_id):
+    """Decrypting every message on every click took ~0.4 s per 5,000 messages."""
+    return ({m["id"]: m for m in db.get_messages(chat_id)}, db.get_items(chat_id),
+            placeholder_alternatives(db.get_privacy(chat_id)))
+
 if "_new_chat" in st.session_state:
     st.session_state["chat"] = st.session_state.pop("_new_chat")
 
 chat_rows = db.list_chats()
 chat_ids = [row[0] for row in chat_rows]
-chat_meta = {row[0]: (row[1], row[2]) for row in chat_rows}
+chat_meta = {row[0]: (row[1], row[2]) for row in chat_rows} 
 cid = st.session_state.get("chat")
 if cid not in chat_ids:
     cid = chat_ids[0] if chat_ids else None
     if cid:
         st.session_state["chat"] = cid
 
-messages = {}
-items = []
-if cid:
-    messages = {m["id"]: m for m in db.get_messages(cid)}
-    items = db.get_items(cid)
-
-action_items = [item for item in items if item.get("kind") == "action"]
-decisions = [item for item in items if item.get("kind") == "decision"]
-high_items = [item for item in items if item.get("score", 0) >= 6]
-counts = {"action": len(action_items), "decision": len(decisions), "priority": len(high_items)}
-
-# Browser Back/Forward support, retaining original navigation behavior.
 NAV = ["home", "digest", "chats", "ask", "settings", "evaluation"]
 NAV_LABELS = {
     "home": "⌂  Dashboard",
     "digest": "▤  Digests",
     "chats": "☷  Chats & Sources",
     "ask": "✦  Ask the Conversation",
-    "settings": "⚙  Settings & Privacy",
+    "settings": "⚙  Settings",
     "evaluation": "◫  Extraction & Evaluation",
 }
 qp = st.query_params.get("page", "home")
@@ -243,17 +247,9 @@ if nav != qp:
     else:
         st.query_params["page"] = nav
 st.session_state["_last_page"] = nav
-components.html("""
-<script>
-const app = window.parent;
-if (!app.__aiInboxPopstateHandler) {
-  app.__aiInboxPopstateHandler = () => app.location.reload();
-  app.addEventListener("popstate", app.__aiInboxPopstateHandler);
-}
-</script>
-""", height=0)
 
 # ---------------------------- Sidebar ----------------------------
+
 with st.sidebar:
     st.markdown("<div class='logo'><div class='logo-icon'>📥</div><div>AI-Inbox<div style='font-size:.68rem;color:#9ba8c9;font-weight:500'>From Chats to Clarity</div></div></div>", unsafe_allow_html=True)
     st.radio("Navigation", NAV, format_func=lambda key: NAV_LABELS[key], key="nav", label_visibility="collapsed")
@@ -263,14 +259,8 @@ with st.sidebar:
         st.radio("Chats", chat_ids, format_func=lambda chat_id: f"◉  {chat_meta[chat_id][0]}",
                  key="chat", label_visibility="collapsed")
         cid = st.session_state.get("chat")
-        if cid:
-            messages = {m["id"]: m for m in db.get_messages(cid)}
-            items = db.get_items(cid)
-            action_items = [item for item in items if item.get("kind") == "action"]
-            decisions = [item for item in items if item.get("kind") == "decision"]
-            high_items = [item for item in items if item.get("score", 0) >= 6]
-            counts = {"action": len(action_items), "decision": len(decisions), "priority": len(high_items)}
     else:
+        cid = None
         st.caption("No chats yet. Add an export to get started.")
 
     with st.expander("➕ Add a chat", expanded=not chat_ids):
@@ -285,42 +275,67 @@ with st.sidebar:
                 st.warning("Please choose a .txt file first.")
             elif not consent:
                 st.warning("Please confirm you have permission to process this chat.")
+            elif uploaded.size > MAX_UPLOAD_MB * 1024 * 1024:
+                st.warning(f"File is larger than {MAX_UPLOAD_MB} MB.")
             else:
                 os.makedirs(RAW_DIR, exist_ok=True)
-                file_path = os.path.join(RAW_DIR, f"upload_{int(time.time())}.txt")
+                
+                file_path = os.path.join(RAW_DIR, f"upload_{uuid.uuid4().hex}.txt")
                 try:
                     with open(file_path, "wb") as handle:
                         handle.write(uploaded.getbuffer())
                     with st.spinner("Reading, protecting and analyzing the conversation..."):
-                        new_chat_id = run_pipeline(file_path, chat_name, [a.strip() for a in aliases.split(",") if a.strip()])
-                    st.session_state["_new_chat"] = new_chat_id
+                        info = process(file_path, chat_name.strip() or "My chat",
+                                       [a.strip() for a in aliases.split(",") if a.strip()])
+                    st.session_state["_new_chat"] = info["chat_id"]
+                    st.session_state["_upload_notice"] = {"stats": info["stats"], "raw_deleted": info["raw_deleted"]}
                     st.rerun()
                 except Exception as exc:
                     st.error(f"Could not process this chat: {exc}")
-if cid:
+                finally:
+                    try:
+                        if os.path.exists(file_path):
+                            os.remove(file_path)
+                    except OSError:
+                        pass
+
+    if cid:
         with st.expander("🗑 Delete chat data"):
             st.warning("This permanently removes this chat and its stored data.")
             if st.button("Delete this chat", use_container_width=True, key="delete_chat"):
                 db.delete_chat(cid)
+                _load_chat.clear()
                 st.session_state["_reset_chat"] = True
                 st.rerun()
-        created = chat_meta[cid][1] if cid in chat_meta else None
-else:
-        created = None
 
-if created is not None:
-    synced = time.strftime("%H:%M", time.localtime(created))
-else:
-    synced = "Unknown"
-
-st.markdown(f"<div class='status'><div class='pulse'></div><div><b>Workspace ready</b><br><span>Last synced {synced}</span></div></div>", unsafe_allow_html=True)
-st.caption(f"AI mode: {MODE} · Retention: {RETENTION_DAYS} days")
-if created is not None:
-    synced = time.strftime("%H:%M", time.localtime(created))
-else:
-    synced = "Unknown"
+    created = chat_meta[cid][1] if cid in chat_meta else None
+    synced = time.strftime("%H:%M", time.localtime(created)) if created is not None else "Unknown"
     st.markdown(f"<div class='status'><div class='pulse'></div><div><b>Workspace ready</b><br><span>Last synced {synced}</span></div></div>", unsafe_allow_html=True)
     st.caption(f"AI mode: {MODE} · Retention: {RETENTION_DAYS} days")
+
+# ---------------------------- Active chat data (loaded once) ----------------------------
+messages = {}
+items = []
+if cid:
+    messages, items, ACTIVE_ALTS = _load_chat(cid)
+chat_title = chat_meta[cid][0] if cid in chat_meta else ""   # BUG FIX #24 (see notes)
+action_items = [item for item in items if item.get("kind") == "action"]
+decisions = [item for item in items if item.get("kind") == "decision"]
+high_items = [item for item in items if item.get("score", 0) >= 6]
+n_messages, n_actions, n_decisions, n_high = len(messages), len(action_items), len(decisions), len(high_items)
+
+
+notice = st.session_state.pop("_upload_notice", None)
+if notice:
+    stats = notice["stats"]
+    st.success(f"Analyzed {stats['messages']} messages → {stats['actions']} action items, {stats['decisions']} decisions.")
+    if stats.get("failed_chunks"):
+        st.warning(f"{stats['failed_chunks']} of {stats['total_chunks']} AI calls failed, so results may be incomplete. "
+                   f"First error: {(stats.get('errors') or ['unknown'])[0]}")
+    if stats.get("rejected_by_verification"):
+        st.caption(f"{stats['rejected_by_verification']} extracted item(s) were rejected because they could not be verified against the chat.")
+    if not notice.get("raw_deleted", True):
+        st.warning("The raw uploaded file could not be deleted automatically. Please remove it from the data/raw folder.")
 
 # ---------------------------- Top bar ----------------------------
 top_left, top_right = st.columns([5, 1])
@@ -344,14 +359,6 @@ if not cid:
     st.info("Open **Add a chat** in the sidebar, upload a WhatsApp `.txt` export, confirm consent, and click Analyze.")
     st.stop()
 
-# Recompute active-chat values after sidebar selection.
-chat_meta = {row[0]: row for row in chat_rows}
-messages = {m["id"]: m for m in db.get_messages(cid)}
-items = db.get_items(cid)
-action_items = [item for item in items if item.get("kind") == "action"]
-decisions = [item for item in items if item.get("kind") == "decision"]
-high_items = [item for item in items if item.get("score", 0) >= 6]
-n_messages, n_actions, n_decisions, n_high = len(messages), len(action_items), len(decisions), len(high_items)
 filtered = [item for item in items if item_matches(item, query, messages)]
 
 # ---------------------------- Dashboard ----------------------------
@@ -380,7 +387,7 @@ if nav == "home":
                 rows = [item for item in rows if item.get("kind") == "decision"]
             elif selected_filter == "Priorities":
                 rows = [item for item in rows if item.get("score", 0) >= 6]
-            rows = sorted(rows, key=lambda item: max(item.get("source_message_ids", ["0"])), reverse=True)
+            rows = sorted(rows, key=lambda item: max(item.get("source_message_ids") or [0]), reverse=True)
             render_items(rows[:7], messages)
     with side_col:
         with st.container(key="card_topics"):
@@ -399,7 +406,7 @@ if nav == "home":
 
 # ---------------------------- Digests ----------------------------
 elif nav == "digest":
-    page_header("Conversation Digest", f"{chat_meta[cid][0]} · {len(items)} extracted items")
+    page_header("Conversation Digest", f"{chat_title} · {len(items)} extracted items")
     tabs = st.tabs(["All insights", f"Action Items ({n_actions})", f"Decisions ({n_decisions})", f"Priorities ({n_high})", "Topics"])
     with tabs[0]:
         st.markdown(f"<span class='tag high'>High · {sum(1 for x in items if priority(x.get('score',0))[0]=='high')}</span><span class='tag medium'>Medium · {sum(1 for x in items if priority(x.get('score',0))[0]=='medium')}</span><span class='tag low'>Low · {sum(1 for x in items if priority(x.get('score',0))[0]=='low')}</span>", unsafe_allow_html=True)
@@ -422,25 +429,25 @@ elif nav == "digest":
 
 # ---------------------------- Chat explorer / source links ----------------------------
 elif nav == "chats":
-    page_header("Chats & Source Links", f"{chat_meta[cid][0]} · {n_messages} messages")
+    page_header("Chats & Source Links", f"{chat_title} · {n_messages} messages")
     left, right = st.columns([1, 1.05])
     with left:
         st.markdown("<div class='section-title'>Original messages</div>", unsafe_allow_html=True)
         msg_query = st.text_input("Search this chat", placeholder="Search sender or message text...", key="message_search")
         all_messages = list(messages.values())
-        all_messages.sort(key=lambda msg: str(msg.get("id", "")), reverse=True)
+        all_messages.sort(key=lambda msg: int(msg.get("id", 0)), reverse=True)
         visible = [msg for msg in all_messages if msg_query.lower() in (str(msg.get("text", "")) + str(msg.get("sender", "")) + str(msg.get("id", ""))).lower()]
         if not visible:
             st.info("No messages match that search.")
         for msg in visible[:100]:
             mid = str(msg.get("id", ""))
             with st.expander(f"{msg.get('sender','Unknown')} · #{mid} · {msg.get('timestamp','')}", expanded=False):
-                st.write(msg.get("text", ""))
+                st.text(msg.get("text", ""))
                 linked = [item for item in items if mid in [str(value) for value in item.get("source_message_ids", [])]]
                 if linked:
                     st.caption(f"{len(linked)} extracted item(s) linked to this message")
                     for item in linked:
-                        st.markdown(f"• **{esc(item_title(item))}** — {item.get('kind','item')}", unsafe_allow_html=True)
+                        st.markdown(f"• **{esc(item_title(item))}** — {esc(item.get('kind','item'))}", unsafe_allow_html=True)
                 else:
                     st.caption("No extracted item linked to this message.")
     with right:
@@ -455,7 +462,7 @@ elif nav == "chats":
             source_messages = [messages[mid] for mid in selected_item.get("source_message_ids", []) if mid in messages]
             st.markdown("**Original evidence**")
             if source_messages:
-                bubbles(source_messages, quote=selected_item.get("quote"))
+                bubbles(source_messages, quote=selected_item.get("quote"), quote_safe=selected_item.get("quote_safe"))
             else:
                 st.warning("The stored source IDs do not resolve to messages in this chat.")
             st.caption("Evidence shown here comes from the existing database records; this screen does not generate new source claims.")
@@ -473,18 +480,23 @@ elif nav == "ask":
         with st.spinner("Searching messages and verifying the answer..."):
             result = search.ask(cid, question)
         verified = bool(result.get("verified"))
-        badge = "<span class='ok'>✔ Verified against source messages</span>" if verified else "<span class='warn'>⚠ Could not verify completely</span>"
+        if result.get("derived"):
+            badge = "<span class='ok'>✔ Built from verified extracted items</span>"
+        elif verified:
+            badge = "<span class='ok'>✔ Verified against source messages</span>"
+        else:
+            badge = "<span class='warn'>⚠ Could not verify completely</span>"
         st.markdown(f"<div class='answer'>{esc(result.get('answer','No answer returned.'))}<br><br>{badge}</div>", unsafe_allow_html=True)
         if not verified and result.get("reason"):
             st.caption(f"Verification detail: {result['reason']}")
         sources = result.get("sources") or []
         if sources:
             st.markdown("**Source messages**")
-            bubbles(sources, quote=result.get("quote"))
+            bubbles(sources, quote=result.get("quote"), quote_safe=result.get("quote_safe"))
         elif result.get("retrieved"):
             with st.expander("Closest retrieved messages"):
-                bubbles(result["retrieved"], quote=result.get("quote"))
-        else:
+                bubbles(result["retrieved"], quote=result.get("quote"), quote_safe=result.get("quote_safe"))
+        elif not result.get("derived"):
             st.info("No source messages were returned for this answer.")
     else:
         st.markdown("<div class='subtle'>Suggested questions</div>", unsafe_allow_html=True)
@@ -496,38 +508,35 @@ elif nav == "ask":
                     st.session_state["pending_q"] = suggestion
                     st.rerun()
 
-# ---------------------------- Settings & privacy ----------------------------
+# ---------------------------- Settings & privacy (read-only, shows REAL config) ----------------------------
 elif nav == "settings":
-    page_header("Settings & Privacy", "Privacy-aware processing and importance scoring")
+    page_header("Settings & Privacy", "Current configuration (change it in your .env file and restart)")
     privacy_tab, scoring_tab, storage_tab = st.tabs(["Privacy controls", "Importance scoring", "Storage"])
     with privacy_tab:
         st.markdown("<div class='section-title'>Data protection</div>", unsafe_allow_html=True)
-        st.info("The controls below describe your current app configuration. Toggle values are UI preferences unless connected to backend configuration.")
-        redact = st.toggle("Redact phone numbers before AI processing", value=True, key="setting_redact")
-        delete_raw = st.toggle("Delete raw export after processing", value=True, key="setting_delete_raw")
-        allow_delete = st.toggle("Enable per-chat data deletion", value=True, key="setting_chat_delete")
-        retention = st.selectbox("Retention period (display only)", [str(RETENTION_DAYS) + " days", "7 days", "30 days", "90 days", "Keep until manually deleted"], index=0, key="setting_retention")
-        st.caption("Current configured automatic retention: " + str(RETENTION_DAYS) + " days. Changing the controls above does not change config.py or the pipeline.")
-        if st.button("Review privacy configuration", type="primary"):
-            st.write({"phone_redaction_ui": redact, "raw_file_deletion_ui": delete_raw, "per_chat_deletion_ui": allow_delete, "configured_retention_days": RETENTION_DAYS})
-        if not allow_delete:
-            st.warning("The delete-chat control is still enforced by the current sidebar implementation; this toggle is not wired to backend authorization.")
+        st.info("These values come from your configuration and are read-only. The old toggles and sliders did nothing, so they were removed.")
+        st.dataframe(pd.DataFrame([
+            {"Setting": "AI mode", "Value": MODE},
+            {"Setting": "Regex redaction (phones, emails, links, PAN, Aadhaar, bank no., OTP)", "Value": "Always on"},
+            {"Setting": "Presidio name/place detection", "Value": "On" if USE_PRESIDIO else "Off"},
+            {"Setting": "Raw upload deleted after processing", "Value": "Always (web upload)"},
+            {"Setting": "Automatic retention (days)", "Value": str(RETENTION_DAYS)},
+            {"Setting": "Login password", "Value": "Enabled" if APP_PASSWORD else "Not set"},
+        ]), hide_index=True, use_container_width=True)
     with scoring_tab:
         st.markdown("<div class='section-title'>Importance scoring weights</div>", unsafe_allow_html=True)
-        st.caption("These sliders are a UI preview. Persist them only after wiring them to your scoring implementation.")
-        deadline_weight = st.slider("Deadline signal", 0, 10, 8, key="weight_deadline")
-        mention_weight = st.slider("Personal mention", 0, 10, 7, key="weight_mention")
-        urgency_weight = st.slider("Urgency language", 0, 10, 6, key="weight_urgency")
-        st.markdown(f"<div class='answer'>Preview weights · Deadline <b>{deadline_weight}</b> · Mention <b>{mention_weight}</b> · Urgency <b>{urgency_weight}</b></div>", unsafe_allow_html=True)
+        st.caption("Weights come from score.py. Edit WEIGHTS there to change them.")
+        st.dataframe(pd.DataFrame([{"Signal": k, "Points": v} for k, v in score.WEIGHTS.items()]), hide_index=True, use_container_width=True)
+        st.caption("Urgency words: " + ", ".join(score.URGENT_WORDS))
     with storage_tab:
         st.markdown("<div class='section-title'>Application storage</div>", unsafe_allow_html=True)
-        st.code(f"Raw upload directory: {RAW_DIR}\nConfigured retention: {RETENTION_DAYS} days\nAI mode: {MODE}\nDatabase: managed by db.py")
-        st.caption("Database and FAISS/index cleanup must be implemented through your existing backend functions; this page intentionally does not delete files directly.")
+        st.code(f"Raw upload directory: {RAW_DIR}\nConfigured retention: {RETENTION_DAYS} days\nAI mode: {MODE}\nDatabase + search index: encrypted, managed by db.py / search.py")
+        st.caption("Use 'Delete this chat' in the sidebar to remove a chat together with its search index.")
 
 # ---------------------------- Extraction & evaluation ----------------------------
 elif nav == "evaluation":
     page_header("Extraction & Evaluation", "Review available extraction data and source-validation status")
-    # Do not fabricate benchmark metrics: the current app does not expose labeled evaluation runs.
+
     total_items = len(items)
     sourced_items = sum(1 for item in items if item.get("source_message_ids") and any(mid in messages for mid in item.get("source_message_ids", [])))
     source_coverage = sourced_items / total_items if total_items else 0.0
@@ -557,9 +566,8 @@ elif nav == "evaluation":
             {"Check": "Items without resolvable sources", "Count": total_items - sourced_items},
             {"Check": "Messages stored", "Count": n_messages},
         ]), hide_index=True, use_container_width=True)
-        st.warning("Precision, recall, and F1 require hand-labeled ground-truth data. They are not estimated here because the current backend does not expose evaluation results.")
+        st.warning("Precision, recall, and F1 need hand-labeled ground truth. Run `python evaluation/evaluate.py` to compute them.")
 
-# URL may lag after a sidebar radio change during the first rerun; keep URL synced.
 if st.session_state.get("nav", "home") != st.query_params.get("page", "home"):
     current = st.session_state["nav"]
     if current == "home":

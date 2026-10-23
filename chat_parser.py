@@ -1,7 +1,7 @@
 import re
 
 SEP = r"[/.\-]"
-DATE = rf"\d{{1,2}}{SEP}\d{{1,2}}{SEP}\d{{2,4}}"
+DATE = rf"(?:\d{{4}}{SEP}\d{{1,2}}{SEP}\d{{1,2}}|\d{{1,2}}{SEP}\d{{1,2}}{SEP}\d{{2,4}})"
 TIME = r"\d{1,2}:\d{2}(?::\d{2})?\s?(?:[ap]\.?m\.?)?"
 START = re.compile(rf"^\[?({DATE}),?\s+({TIME})\]?\s*[-–—]?\s*(.*)$", re.I)
 
@@ -24,13 +24,20 @@ SYSTEM_SENDER = re.compile(
     r"|\bsecurity code\b|\b(added|removed|left|joined)\b.*\b(group|you|invite)\b",
     re.I,
 )
-INVISIBLE = dict.fromkeys(map(ord, "‎‏‪‫‬‭‮"), None)
+
+INVISIBLE = dict.fromkeys(
+    [0x200E, 0x200F, 0x202A, 0x202B, 0x202C, 0x202D, 0x202E, 0xFEFF], None
+)
+
+PROMPT_TAG = re.compile(r"<\s*/?\s*untrusted_message\b[^>]*>", re.I)
 
 def _clean(line: str) -> str:
-    cleaned = line.replace(" ", " ").replace(" ", " ").translate(INVISIBLE).rstrip("\r\n")
-    # Escape untrusted tags to prevent prompt injection breaking <untrusted_message>
-    cleaned = cleaned.replace("<untrusted_message>", "&lt;untrusted_message&gt;").replace("</untrusted_message>", "&lt;/untrusted_message&gt;")
-    return cleaned
+    cleaned = line.replace("\u00a0", " ").replace("\u202f", " ")
+    cleaned = cleaned.translate(INVISIBLE).rstrip("\r\n")
+    return PROMPT_TAG.sub(lambda m: m.group(0).replace("<", "&lt;").replace(">", "&gt;"), cleaned)
+
+def _clean_sender(sender: str) -> str:
+    return sender.strip().lstrip("~").strip()
 
 def parse_text(text: str):
     messages, cur = [], None
@@ -47,14 +54,15 @@ def parse_text(text: str):
             sender, body = rest.split(": ", 1)
             if SYSTEM_SENDER.search(sender) or len(sender) > 60:
                 continue
+            sender = _clean_sender(sender)
             body = EDITED_SUFFIX.sub("", body).strip()
-            if not body or SKIP_TEXT.match(body):
+            if not sender or not body or SKIP_TEXT.match(body):
                 continue
             cur = {
                 "id": 0,
-                "timestamp": f"{m.group(1)} {m.group(2)}",
-                "sender": sender.strip(),
-                "text": body
+                "timestamp": f"{m.group(1)} {m.group(2).strip()}",
+                "sender": sender,
+                "text": body,
             }
         elif cur is not None:
             cur["text"] += "\n" + line.strip()

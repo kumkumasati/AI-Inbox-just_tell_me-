@@ -1,9 +1,9 @@
-import argparse, os, hashlib, uuid
+import argparse, hashlib, os, threading, uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import db, search
 from chat_parser import parse_chat
-from config import *
+from config import USE_PRESIDIO
 from extract import chunks, extract_chunk
 from privacy import build_name_map, protect, pseudonymize, restore
 from score import score_item
@@ -12,21 +12,34 @@ from verify import verify
 class PipelineError(RuntimeError):
     pass
 
+_CACHE_MAX = 256
 _chunk_cache = {}
+_cache_lock = threading.Lock()
 
 def _hash_chunk(chunk_msgs):
-    raw = "".join(f"{m['sender']}:{m['text']}" for m in chunk_msgs)
+    raw = "\n".join(f"{m['id']}|{m['sender']}|{m['text']}" for m in chunk_msgs)
     return hashlib.sha256(raw.encode()).hexdigest()
+
+def _cache_get(h):
+    with _cache_lock:
+        return _chunk_cache.get(h)
+
+def _cache_put(h, value):
+    with _cache_lock:
+        if len(_chunk_cache) >= _CACHE_MAX:
+            _chunk_cache.pop(next(iter(_chunk_cache)))
+        _chunk_cache[h] = value
 
 def _process_single_chunk(ch_idx, ch):
     h = _hash_chunk(ch)
-    if h in _chunk_cache:
-        return ch_idx, _chunk_cache[h], None
+    cached = _cache_get(h)
+    if cached is not None:
+        return ch_idx, cached, None
     try:
         ex = extract_chunk(ch)
         if ex is None:
             return ch_idx, None, "empty extraction response"
-        _chunk_cache[h] = ex
+        _cache_put(h, ex)
         return ch_idx, ex, None
     except Exception as e:
         return ch_idx, None, str(e)
@@ -36,9 +49,9 @@ def analyze(path, my_aliases, use_presidio=None):
     raw = parse_chat(path)
     if not raw:
         raise PipelineError("No messages found in chat file.")
-    
+
     name_map, names = build_name_map(raw, my_aliases)
-    
+
     sender_cache = {}
     def get_safe_sender(s):
         if s not in sender_cache:
@@ -50,7 +63,7 @@ def analyze(path, my_aliases, use_presidio=None):
         "sender": get_safe_sender(m["sender"]),
         "text": protect(m["text"], name_map, use_presidio, names)
     } for m in raw]
-    
+
     orig_by_id = {m["id"]: m for m in raw}
     safe_by_id = {m["id"]: m for m in safe}
 
@@ -103,12 +116,13 @@ def analyze(path, my_aliases, use_presidio=None):
             orig_text = " ".join(orig_by_id[i]["text"] for i in o.source_message_ids if i in orig_by_id)
             s, reasons = score_item(orig_text, getattr(o, "deadline", None), getattr(o, "assignee", None), my_aliases)
             d = o.model_dump()
+            d["quote_safe"] = d.get("quote")      # anonymised quote, used for highlighting
             for f in ("task", "assignee", "decision", "deadline", "quote"):
                 if d.get(f):
                     d[f] = restore(d[f], names)
             d.update(kind=kind, score=s, reasons=reasons, topic=topic_of.get(o.source_message_ids[0], "General"))
             items.append(d)
-            
+
     return {
         "messages": raw, "safe": safe, "name_map": name_map, "names": names, "items": items,
         "stats": {

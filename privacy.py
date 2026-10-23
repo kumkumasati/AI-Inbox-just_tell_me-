@@ -3,35 +3,52 @@ import re
 EMAIL = re.compile(r"[\w\.-]+@[\w\.-]+(?:\.\w+)?")
 URL = re.compile(r"https?://\S+")
 
-# Tightened Indian mobile regex plus strict international formats
 PHONE = re.compile(r"(?<!\d)(?:\+?91[\s-]?)?[6-9]\d{4}[\s-]?\d{5}(?!\d)")
 INTERNATIONAL_PHONE = re.compile(r"(?<!\d)\+(?:[0-9]\s?){6,14}[0-9](?!\d)")
 
 PAN = re.compile(r"\b[A-Z]{5}\d{4}[A-Z]\b", re.I)
+AADHAAR = re.compile(r"(?<!\d)[2-9]\d{3}[\s-]?\d{4}[\s-]?\d{4}(?!\d)")
 BANK_ACC = re.compile(r"\b\d{9,18}\b")
-OTP = re.compile(r"\b(?i:otp|code|verification)\s*[:\-]?\s*(\d{4,8})\b")
+OTP = re.compile(r"\b((?i:otp|code|verification)\s*[:\-]?\s*)(\d{4,8})\b")
 
-KINDS = ("PERSON", "PLACE", "PHONE", "LINK", "EMAIL", "PAN", "BANK", "OTP")
+KINDS = ("PERSON", "PLACE", "PHONE", "LINK", "EMAIL", "PAN", "AADHAAR", "BANK", "OTP")
 _KIND_ALT = "|".join(KINDS)
-PLACEHOLDER = re.compile(rf"(?:{_KIND_ALT})_\d+|ME")
-_RESTORE = re.compile(rf"\b((?:{_KIND_ALT})_\d+|ME)\b")
+
+PLACEHOLDER = re.compile(rf"\b(?:(?:{_KIND_ALT})_\d+|ME)\b")
+_RESTORE = re.compile(rf"(\b(?:{_KIND_ALT})_\d+\b|(?<![\w-])ME(?![\w-]))")
 
 COMMON_WORDS = {"will", "hope", "may", "grant", "joy", "march", "mark", "rose", "grace"}
+
+def _find_my_senders(senders, aliases):
+    """Which sender name(s) in the export are the user?
+    Exact alias match wins. Otherwise, if exactly ONE sender contains an alias as a whole
+    word (alias 'Rahul' vs export name 'Rahul Sharma') that sender is the user.
+    Ambiguous matches (two 'Rahul's) are left alone rather than guessed."""
+    exact = {s for s in senders if s.lower() in aliases}
+    if exact:
+        return exact
+    single_word = {a for a in aliases if " " not in a}
+    loose = [s for s in senders if single_word & set(re.findall(r"\w+", s.lower()))]
+    return set(loose) if len(loose) == 1 else set()
 
 def build_name_map(messages, my_aliases):
     aliases = {a.lower().strip() for a in my_aliases if a.strip()}
     name_map = {a: "ME" for a in aliases}
     names = {"ME": "You"}
+    senders = list(dict.fromkeys(m["sender"] for m in messages))
+    me_senders = _find_my_senders(senders, aliases)
+    for s in me_senders:
+        name_map[s.lower()] = "ME"         
     n = 0
-    for sender in dict.fromkeys(m["sender"] for m in messages):
+    for sender in senders:
         low = sender.lower()
-        if low in aliases:
+        if sender in me_senders or low in aliases:
             continue
         n += 1
         fake = f"PERSON_{n}"
         name_map[low] = fake
         names[fake] = sender
-        
+
         parts = low.split()
         if len(parts) > 1:
             first = parts[0]
@@ -64,8 +81,9 @@ def regex_redact(text, names):
     text = URL.sub(lambda m: _placeholder("LINK", m.group(0), names), text)
     text = PHONE.sub(lambda m: _placeholder("PHONE", m.group(0), names), text)
     text = INTERNATIONAL_PHONE.sub(lambda m: _placeholder("PHONE", m.group(0), names), text)
+    text = AADHAAR.sub(lambda m: _placeholder("AADHAAR", m.group(0), names), text)
     text = BANK_ACC.sub(lambda m: _placeholder("BANK", m.group(0), names), text)
-    text = OTP.sub(lambda m: _placeholder("OTP", m.group(0), names), text)
+    text = OTP.sub(lambda m: m.group(1) + _placeholder("OTP", m.group(2), names), text)
     return text
 
 _analyzer = None
@@ -83,7 +101,7 @@ def _get_analyzer():
     return _analyzer
 
 def presidio_redact(text, names):
-    # Fail closed: will raise explicit error if Presidio engine is unavailable when enabled
+    
     analyzer = _get_analyzer()
     results = analyzer.analyze(text=text, language="en", entities=["PERSON", "LOCATION"], score_threshold=0.5)
     out, limit = text, len(text)
