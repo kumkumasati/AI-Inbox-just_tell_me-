@@ -12,7 +12,7 @@ import os
 import time
 import uuid
 from collections import Counter
-
+from pathlib import Path
 import pandas as pd
 import streamlit as st
 
@@ -89,6 +89,73 @@ mark { background: rgba(255, 235, 59, 0.35); color: #fff; padding: 2px 4px; bord
 hr{border-color:rgba(255,255,255,.09)}
 </style>
 """, unsafe_allow_html=True)
+
+
+#---------Login And Logout page
+# Initialize Session State
+if "authenticated" not in st.session_state:
+    st.session_state["authenticated"] = False
+if "user_id" not in st.session_state:
+    st.session_state["user_id"] = None
+if "username" not in st.session_state:
+    st.session_state["username"] = None
+
+DB_PATH = Path("data/inbox.db")
+
+# --- AUTHENTICATION SCREEN ---
+if not st.session_state["authenticated"]:
+    st.set_page_config(page_title="AI-Inbox | Login", page_icon="🔐", layout="centered")
+    
+    st.title("📥 AI-Inbox")
+    st.caption("Privacy-First WhatsApp Chat Analyzer")
+    st.markdown("---")
+    
+    auth_mode = st.radio("Choose Action", ["Login", "Sign Up"], horizontal=True)
+    
+    if auth_mode == "Login":
+        st.subheader("🔑 Account Login")
+        with st.form("login_form"):
+            username = st.text_input("Username")
+            password = st.text_input("Password", type="password")
+            submit = st.form_submit_button("Log In", use_container_width=True)
+            
+            if submit:
+                if username and password:
+                    user = db.verify_user( username, password)
+                    if user:
+                        st.session_state["authenticated"] = True
+                        st.session_state["user_id"] = user["id"]
+                        st.session_state["username"] = user["username"]
+                        st.success("Successfully logged in!")
+                        st.rerun()
+                    else:
+                        st.error("Invalid username or password.")
+                else:
+                    st.warning("Please fill in all fields.")
+
+    else:
+        st.subheader("📝 Create New Account")
+        with st.form("signup_form"):
+            new_user = st.text_input("Choose Username")
+            new_pass = st.text_input("Choose Password", type="password")
+            confirm_pass = st.text_input("Confirm Password", type="password")
+            submit_signup = st.form_submit_button("Sign Up", use_container_width=True)
+            
+            if submit_signup:
+                if new_user and new_pass:
+                    if new_pass != confirm_pass:
+                        st.error("Passwords do not match.")
+                    else:
+                        new_id = f"user_{uuid.uuid4().hex[:8]}"
+                        if db.create_user( new_id, new_user, new_pass):
+                            st.success("Account created successfully! You can now log in.")
+                        else:
+                            st.error("Username already exists. Please pick another one.")
+                else:
+                    st.warning("Please fill in all fields.")
+
+    st.stop()  # Stop execution here so unauthenticated users see nothing else.
+
 
 # ---------------------------- Optional login gate ----------------------------
 def require_login():
@@ -214,7 +281,8 @@ def _load_chat(chat_id):
 if "_new_chat" in st.session_state:
     st.session_state["chat"] = st.session_state.pop("_new_chat")
 
-chat_rows = db.list_chats()
+
+chat_rows = db.list_chats(user_id=st.session_state["user_id"])
 chat_ids = [row[0] for row in chat_rows]
 chat_meta = {row[0]: (row[1], row[2]) for row in chat_rows} 
 cid = st.session_state.get("chat")
@@ -249,12 +317,27 @@ if nav != qp:
 st.session_state["_last_page"] = nav
 
 # ---------------------------- Sidebar ----------------------------
-
 with st.sidebar:
+    # --- USER PROFILE & LOGOUT SECTION ---
+    st.markdown(f"<div style='padding: 0.2rem 0 0.8rem 0; color: #9ba8c9; font-size: 0.85rem;'>👤 Logged in as: <b>{st.session_state.get('username', 'User')}</b></div>", unsafe_allow_html=True)
+    if st.button("🚪 Logout", use_container_width=True, key="sidebar_logout_btn"):
+        st.session_state["authenticated"] = False
+        st.session_state["user_id"] = None
+        st.session_state["username"] = None
+        st.rerun()
+        
+    st.markdown("---")
+
     st.markdown("<div class='logo'><div class='logo-icon'>📥</div><div>AI-Inbox<div style='font-size:.68rem;color:#9ba8c9;font-weight:500'>From Chats to Clarity</div></div></div>", unsafe_allow_html=True)
     st.radio("Navigation", NAV, format_func=lambda key: NAV_LABELS[key], key="nav", label_visibility="collapsed")
     nav = st.session_state["nav"]
     st.markdown("<div class='side-label'>Your conversations</div>", unsafe_allow_html=True)
+    
+    # --- MULTI-TENANT CHAT FETCHING ---
+    raw_chats = db.list_chats(user_id=st.session_state["user_id"])
+    chat_ids = [c[0] for c in raw_chats]
+    chat_meta = {c[0]: (c[1], c[2]) for c in raw_chats}
+
     if chat_ids:
         st.radio("Chats", chat_ids, format_func=lambda chat_id: f"◉  {chat_meta[chat_id][0]}",
                  key="chat", label_visibility="collapsed")
@@ -286,7 +369,8 @@ with st.sidebar:
                         handle.write(uploaded.getbuffer())
                     with st.spinner("Reading, protecting and analyzing the conversation..."):
                         info = process(file_path, chat_name.strip() or "My chat",
-                                       [a.strip() for a in aliases.split(",") if a.strip()])
+                                       [a.strip() for a in aliases.split(",") if a.strip()],
+                                       user_id=st.session_state["user_id"])
                     st.session_state["_new_chat"] = info["chat_id"]
                     st.session_state["_upload_notice"] = {"stats": info["stats"], "raw_deleted": info["raw_deleted"]}
                     st.rerun()
@@ -304,7 +388,8 @@ with st.sidebar:
             st.warning("This permanently removes this chat and its stored data.")
             if st.button("Delete this chat", use_container_width=True, key="delete_chat"):
                 db.delete_chat(cid)
-                _load_chat.clear()
+                if "_load_chat" in globals() and hasattr(_load_chat, "clear"):
+                    _load_chat.clear()
                 st.session_state["_reset_chat"] = True
                 st.rerun()
 
@@ -312,7 +397,6 @@ with st.sidebar:
     synced = time.strftime("%H:%M", time.localtime(created)) if created is not None else "Unknown"
     st.markdown(f"<div class='status'><div class='pulse'></div><div><b>Workspace ready</b><br><span>Last synced {synced}</span></div></div>", unsafe_allow_html=True)
     st.caption(f"AI mode: {MODE} · Retention: {RETENTION_DAYS} days")
-
 # ---------------------------- Active chat data (loaded once) ----------------------------
 messages = {}
 items = []

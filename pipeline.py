@@ -140,14 +140,14 @@ def _remove_raw(path):
         pass
     return not os.path.exists(path)
 
-def process(path, name, my_aliases, delete_raw=True):
+def process(path, name, my_aliases, user_id,delete_raw=True):
     info, cid = None, None
     raw_deleted = False
     try:
         db.init()
         result = analyze(path, my_aliases)
         cid = uuid.uuid4().hex[:8]
-        db.save_chat(cid, name, result)
+        db.save_chat(cid, name, result,user_id=user_id)
         try:
             search.build_index(cid, result["safe"])
         except Exception as e:
