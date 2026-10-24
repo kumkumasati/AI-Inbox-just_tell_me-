@@ -6,11 +6,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
+# The spaCy model is installed from requirements.txt (pinned wheel)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-RUN python -m spacy download en_core_web_sm
 
 COPY . .
+
+# Run as a non-root user; /app/data must be writable (mount a volume here to keep chats)
+RUN useradd -m appuser && mkdir -p /app/data && chown -R appuser:appuser /app
+USER appuser
 
 EXPOSE 8501
 

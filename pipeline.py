@@ -7,11 +7,13 @@ from config import USE_PRESIDIO
 from extract import chunks, extract_chunk
 from privacy import build_name_map, protect, pseudonymize, restore
 from score import score_item
-from verify import verify
+from verify import ground_fields, verify
 
 class PipelineError(RuntimeError):
     pass
 
+# BUG FIX #8: the cache is bounded, thread-safe, and its key now contains the message ids
+# (identical text at a different position used to return wrong source_message_ids).
 _CACHE_MAX = 256
 _chunk_cache = {}
 _cache_lock = threading.Lock()
@@ -88,7 +90,7 @@ def analyze(path, my_aliases, use_presidio=None):
     if total_chunks and failed_chunks == total_chunks:
         raise PipelineError(f"All {total_chunks} AI calls failed. Error: {errors[0] if errors else 'unknown'}")
 
-    topics, actions, decisions, rejected, seen = [], [], [], 0, set()
+    topics, actions, decisions, rejected, unsupported, seen = [], [], [], 0, 0, set()
     for ex in chunk_results:
         if ex is None:
             continue
@@ -103,6 +105,13 @@ def analyze(path, my_aliases, use_presidio=None):
                 if not verify(o.source_message_ids, o.quote, safe_by_id, item_text=item_title):
                     rejected += 1
                     continue
+                if kind == "action":
+                    o = o.model_copy()      # never mutate the cached extraction
+                    assignee_ok, deadline_ok = ground_fields(o.assignee, o.deadline, o.source_message_ids, safe_by_id)
+                    if not assignee_ok:
+                        o.assignee, unsupported = None, unsupported + 1
+                    if not deadline_ok:
+                        o.deadline, unsupported = None, unsupported + 1
                 (actions if kind == "action" else decisions).append(o)
 
     topic_of = {}
@@ -127,7 +136,7 @@ def analyze(path, my_aliases, use_presidio=None):
         "messages": raw, "safe": safe, "name_map": name_map, "names": names, "items": items,
         "stats": {
             "messages": len(raw), "actions": len(actions), "decisions": len(decisions),
-            "rejected_by_verification": rejected, "total_chunks": total_chunks,
+            "rejected_by_verification": rejected, "unsupported_fields_removed": unsupported, "total_chunks": total_chunks,
             "failed_chunks": failed_chunks, "errors": errors[:3]
         }
     }
@@ -140,14 +149,14 @@ def _remove_raw(path):
         pass
     return not os.path.exists(path)
 
-def process(path, name, my_aliases, user_id,delete_raw=True):
+def process(path, name, my_aliases, delete_raw=True, user_id=None):
     info, cid = None, None
     raw_deleted = False
     try:
         db.init()
         result = analyze(path, my_aliases)
         cid = uuid.uuid4().hex[:8]
-        db.save_chat(cid, name, result,user_id=user_id)
+        db.save_chat(cid, name, result, user_id=user_id)
         try:
             search.build_index(cid, result["safe"])
         except Exception as e:
@@ -161,8 +170,8 @@ def process(path, name, my_aliases, user_id,delete_raw=True):
         info["raw_deleted"] = raw_deleted
     return info
 
-def run_pipeline(path, name, my_aliases, delete_raw=True):
-    info = process(path, name, my_aliases, delete_raw)
+def run_pipeline(path, name, my_aliases, delete_raw=True, user_id=None):
+    info = process(path, name, my_aliases, delete_raw, user_id=user_id)
     return info["chat_id"]
 
 if __name__ == "__main__":
@@ -171,6 +180,11 @@ if __name__ == "__main__":
     ap.add_argument("--me", nargs="*", default=[], help="your names/aliases")
     ap.add_argument("--name", default="My chat")
     ap.add_argument("--keep-raw", action="store_true", help="Opt-out flag to keep raw upload file")
+    ap.add_argument("--user", required=True, help="username (create it in the app first) that will own the chat")
     a = ap.parse_args()
-    cid = run_pipeline(a.file, a.name, a.me, delete_raw=not a.keep_raw)
+    db.init()
+    uid = db.get_user_id(a.user)
+    if uid is None:
+        raise SystemExit(f"No account named '{a.user}'. Sign up in the app first.")
+    cid = run_pipeline(a.file, a.name, a.me, delete_raw=not a.keep_raw, user_id=uid)
     print("\nProcessed Chat ID:", cid)

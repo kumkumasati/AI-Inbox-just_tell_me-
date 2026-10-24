@@ -12,7 +12,9 @@ class LLMError(RuntimeError):
 
 @lru_cache(maxsize=1)
 def _client():
-   
+    # Created once and reused (was: a new client for every call).
+    # BUG FIX #8: retries are handled ONLY by the SDK (429 / 5xx / timeouts).
+    # The old extra custom backoff loop multiplied retries to ~12 attempts.
     if MODE == "local":
         return OpenAI(base_url=LOCAL_URL, api_key="ollama", timeout=LLM_TIMEOUT, max_retries=2)
     return OpenAI(timeout=LLM_TIMEOUT, max_retries=3)
@@ -36,7 +38,7 @@ def structured(system, user, model_cls):
             r = _create_deterministic(c.chat.completions.create, model=LOCAL_MODEL, response_format={"type": "json_object"}, messages=msgs)
             raw_content = r.choices[0].message.content
 
-
+            # Local JSON repair attempt
             try:
                 return model_cls.model_validate_json(raw_content)
             except Exception:

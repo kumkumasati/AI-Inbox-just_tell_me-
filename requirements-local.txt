@@ -1,0 +1,3 @@
+# Extra dependencies ONLY for MODE=local (Ollama + local embeddings). Large download (PyTorch).
+-r requirements.txt
+sentence-transformers==3.0.1

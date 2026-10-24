@@ -2,25 +2,24 @@
 Run: streamlit run app.py
 
 Backend interfaces used:
-  db.init / purge_old / list_chats / get_messages / get_items / delete_chat
-  search.ask(chat_id, question)
-  pipeline.process(path, chat_name, aliases)
-  config constants: MODE, RETENTION_DAYS, RAW_DIR, APP_PASSWORD
+  db.init / purge_old / create_user / verify_user (accounts, scrypt-hashed, login lockout)
+  db.list_chats / get_messages / get_items / delete_chat   (all scoped to the logged-in user_id)
+  search.ask(chat_id, question, user_id=...)
+  pipeline.process(path, chat_name, aliases, user_id=...)
+  config constants: MODE, RETENTION_DAYS, RAW_DIR
 """
-import hmac
 import os
 import time
 import uuid
 from collections import Counter
-from pathlib import Path
+
 import pandas as pd
 import streamlit as st
 
 import db
 import score
 import search
-from config import (APP_PASSWORD, MAX_UPLOAD_MB, MODE, RAW_DIR, RETENTION_DAYS,
-                    USE_PRESIDIO)
+from config import MAX_UPLOAD_MB, MODE, RAW_DIR, RETENTION_DAYS, USE_PRESIDIO
 from pipeline import process
 from ui_utils import esc, highlight, placeholder_alternatives
 
@@ -90,89 +89,77 @@ hr{border-color:rgba(255,255,255,.09)}
 </style>
 """, unsafe_allow_html=True)
 
+# ---------------------------- Database must exist BEFORE anyone can log in ----------------------------
+@st.cache_resource(ttl=600, show_spinner=False)
+def _maintenance():
+    """Create tables (and migrate old databases), purge expired chats - at most once per 10 minutes."""
+    db.init()
+    return db.purge_old(RETENTION_DAYS)
 
-#---------Login And Logout page
-# Initialize Session State
-if "authenticated" not in st.session_state:
-    st.session_state["authenticated"] = False
-if "user_id" not in st.session_state:
-    st.session_state["user_id"] = None
-if "username" not in st.session_state:
-    st.session_state["username"] = None
-
-DB_PATH = Path("data/inbox.db")
-
-# --- AUTHENTICATION SCREEN ---
-if not st.session_state["authenticated"]:
-    st.set_page_config(page_title="AI-Inbox | Login", page_icon="🔐", layout="centered")
-    
-    st.title("📥 AI-Inbox")
-    st.caption("Privacy-First WhatsApp Chat Analyzer")
-    st.markdown("---")
-    
-    auth_mode = st.radio("Choose Action", ["Login", "Sign Up"], horizontal=True)
-    
-    if auth_mode == "Login":
-        st.subheader("🔑 Account Login")
-        with st.form("login_form"):
-            username = st.text_input("Username")
-            password = st.text_input("Password", type="password")
-            submit = st.form_submit_button("Log In", use_container_width=True)
-            
-            if submit:
-                if username and password:
-                    user = db.verify_user( username, password)
-                    if user:
-                        st.session_state["authenticated"] = True
-                        st.session_state["user_id"] = user["id"]
-                        st.session_state["username"] = user["username"]
-                        st.success("Successfully logged in!")
-                        st.rerun()
-                    else:
-                        st.error("Invalid username or password.")
-                else:
-                    st.warning("Please fill in all fields.")
-
-    else:
-        st.subheader("📝 Create New Account")
-        with st.form("signup_form"):
-            new_user = st.text_input("Choose Username")
-            new_pass = st.text_input("Choose Password", type="password")
-            confirm_pass = st.text_input("Confirm Password", type="password")
-            submit_signup = st.form_submit_button("Sign Up", use_container_width=True)
-            
-            if submit_signup:
-                if new_user and new_pass:
-                    if new_pass != confirm_pass:
-                        st.error("Passwords do not match.")
-                    else:
-                        new_id = f"user_{uuid.uuid4().hex[:8]}"
-                        if db.create_user( new_id, new_user, new_pass):
-                            st.success("Account created successfully! You can now log in.")
-                        else:
-                            st.error("Username already exists. Please pick another one.")
-                else:
-                    st.warning("Please fill in all fields.")
-
-    st.stop()  # Stop execution here so unauthenticated users see nothing else.
-
-
-# ---------------------------- Optional login gate ----------------------------
-def require_login():
-    """Shown only when APP_PASSWORD is set (use it for any public deployment)."""
-    if not APP_PASSWORD or st.session_state.get("authed"):
-        return
-    st.markdown("### 🔒 AI-Inbox")
-    pw = st.text_input("Password", type="password", key="login_pw")
-    if pw:
-        if hmac.compare_digest(pw.encode(), APP_PASSWORD.encode()):
-            st.session_state["authed"] = True
-            st.rerun()
-        else:
-            st.error("Wrong password")
+try:
+    _maintenance()
+except RuntimeError as exc:
+    st.error(str(exc))
     st.stop()
 
-require_login()
+# ---------------------------- Accounts: login / sign up ----------------------------
+for _key, _default in (("authenticated", False), ("user_id", None), ("username", None)):
+    st.session_state.setdefault(_key, _default)
+
+def auth_screen():
+    """Login / sign-up page. Nothing else in the app renders until the user is authenticated."""
+    _, middle, _ = st.columns([1, 1.4, 1])
+    with middle:
+        st.markdown("<div class='logo' style='justify-content:center;margin-top:8vh'><div class='logo-icon'>📥</div>"
+                    "<div>AI-Inbox<div style='font-size:.68rem;color:#9ba8c9;font-weight:500'>Privacy-first WhatsApp chat analyzer</div></div></div>",
+                    unsafe_allow_html=True)
+        mode = st.radio("Choose action", ["Login", "Sign Up"], horizontal=True, key="auth_mode", label_visibility="collapsed")
+        if mode == "Login":
+            with st.form("login_form"):
+                username = st.text_input("Username", key="login_user")
+                password = st.text_input("Password", type="password", key="login_pass")
+                submitted = st.form_submit_button("Log In", use_container_width=True, type="primary")
+            if submitted:
+                if not (username and password):
+                    st.warning("Please fill in all fields.")
+                else:
+                    try:
+                        user = db.verify_user(username, password)
+                    except db.AccountLocked as exc:
+                        st.error(str(exc))
+                    else:
+                        if user:
+                            st.session_state.update(authenticated=True, user_id=user["id"], username=user["username"])
+                            st.rerun()
+                        else:
+                            st.error("Invalid username or password.")
+        else:
+            with st.form("signup_form"):
+                new_user = st.text_input("Choose username", key="signup_user")
+                new_pass = st.text_input("Choose password (min 8 characters)", type="password", key="signup_pass")
+                confirm_pass = st.text_input("Confirm password", type="password", key="signup_confirm")
+                submitted = st.form_submit_button("Sign Up", use_container_width=True, type="primary")
+            if submitted:
+                if not (new_user and new_pass):
+                    st.warning("Please fill in all fields.")
+                elif new_pass != confirm_pass:
+                    st.error("Passwords do not match.")
+                else:
+                    try:
+                        created = db.create_user(uuid.uuid4().hex, new_user, new_pass)
+                    except ValueError as exc:
+                        st.error(str(exc))
+                    else:
+                        if created:
+                            st.success("Account created. Choose 'Login' above to sign in.")
+                        else:
+                            st.error("That username is already taken.")
+
+if not st.session_state["authenticated"]:
+    auth_screen()
+    st.stop()          # unauthenticated visitors see nothing else
+
+user_id = st.session_state["user_id"]
 
 PALETTE = ["#7C6CFF", "#22B8F0", "#2ED3A0", "#FFB020", "#FF5C6C", "#A855F7"]
 
@@ -183,7 +170,7 @@ def priority(score_value):
         return "medium", "Medium"
     return "low", "Low"
 
-ACTIVE_ALTS = {}   
+ACTIVE_ALTS = {}   # placeholder -> real strings for the open chat (filled after the chat is loaded)
 
 def bubbles(messages, quote=None, quote_safe=None):
     """Render message bubbles, highlighting the exact quote if provided."""
@@ -191,7 +178,7 @@ def bubbles(messages, quote=None, quote_safe=None):
         st.markdown(
             f"<div class='bubble'><span class='who'>{esc(m.get('sender','Unknown'))}</span>"
             f"<span class='ts'>#{esc(m.get('id',''))} · {esc(m.get('timestamp',''))}</span>"
-            f"<div>{highlight(m.get('text', ''), quote, quote_safe, ACTIVE_ALTS)}</div></div>",   
+            f"<div>{highlight(m.get('text', ''), quote, quote_safe, ACTIVE_ALTS)}</div></div>",   # BUG FIX #1
             unsafe_allow_html=True,
         )
 
@@ -258,39 +245,30 @@ def page_header(title, subtitle):
     st.markdown(f"<div class='page-head'><h1>{esc(title)}</h1><span>{esc(subtitle)}</span></div>", unsafe_allow_html=True)
 
 # ---------------------------- Backend state ----------------------------
-@st.cache_resource(ttl=600, show_spinner=False)
-def _maintenance():
-    """Create tables and purge expired chats - at most once per 10 minutes, not on every click."""
-    db.init()
-    return db.purge_old(RETENTION_DAYS)
-
-try:
-    _maintenance()
-except RuntimeError as exc:
-    st.error(str(exc))
-    st.stop()
-
 if st.session_state.pop("_reset_chat", False):
     st.session_state.pop("chat", None)
 @st.cache_data(ttl=300, show_spinner=False, max_entries=8)
-def _load_chat(chat_id):
-    """Decrypting every message on every click took ~0.4 s per 5,000 messages."""
-    return ({m["id"]: m for m in db.get_messages(chat_id)}, db.get_items(chat_id),
-            placeholder_alternatives(db.get_privacy(chat_id)))
+def _load_chat(chat_id, owner_id):
+    """Decrypting every message on every click took ~0.4 s per 5,000 messages.
+    The cache key includes the owner, and the db calls re-check ownership."""
+    return ({m["id"]: m for m in db.get_messages(chat_id, user_id=owner_id)},
+            db.get_items(chat_id, user_id=owner_id),
+            placeholder_alternatives(db.get_privacy(chat_id, user_id=owner_id)))
 
 if "_new_chat" in st.session_state:
     st.session_state["chat"] = st.session_state.pop("_new_chat")
 
-
-chat_rows = db.list_chats(user_id=st.session_state["user_id"])
+chat_rows = db.list_chats(user_id=user_id)
 chat_ids = [row[0] for row in chat_rows]
-chat_meta = {row[0]: (row[1], row[2]) for row in chat_rows} 
+chat_meta = {row[0]: (row[1], row[2]) for row in chat_rows}   # chat_id -> (name, created)
 cid = st.session_state.get("chat")
 if cid not in chat_ids:
     cid = chat_ids[0] if chat_ids else None
     if cid:
         st.session_state["chat"] = cid
 
+# Browser Back/Forward support via ?page=... (BUG FIX #20: the old popstate handler
+# called location.reload(), which created a new session and wiped the selected chat)
 NAV = ["home", "digest", "chats", "ask", "settings", "evaluation"]
 NAV_LABELS = {
     "home": "⌂  Dashboard",
@@ -317,27 +295,21 @@ if nav != qp:
 st.session_state["_last_page"] = nav
 
 # ---------------------------- Sidebar ----------------------------
+# BUG FIX #5: everything below now lives inside `with st.sidebar:` and the status
+# block is rendered exactly once (it used to be duplicated and mis-indented).
 with st.sidebar:
     # --- USER PROFILE & LOGOUT SECTION ---
-    st.markdown(f"<div style='padding: 0.2rem 0 0.8rem 0; color: #9ba8c9; font-size: 0.85rem;'>👤 Logged in as: <b>{st.session_state.get('username', 'User')}</b></div>", unsafe_allow_html=True)
+    st.markdown(f"<div style='padding: 0.2rem 0 0.8rem 0; color: #9ba8c9; font-size: 0.85rem;'>👤 Logged in as: <b>{esc(st.session_state.get('username') or 'User')}</b></div>", unsafe_allow_html=True)
     if st.button("🚪 Logout", use_container_width=True, key="sidebar_logout_btn"):
-        st.session_state["authenticated"] = False
-        st.session_state["user_id"] = None
-        st.session_state["username"] = None
+        st.session_state.clear()      # forget the selected chat, search text, etc. as well
         st.rerun()
-        
+
     st.markdown("---")
 
     st.markdown("<div class='logo'><div class='logo-icon'>📥</div><div>AI-Inbox<div style='font-size:.68rem;color:#9ba8c9;font-weight:500'>From Chats to Clarity</div></div></div>", unsafe_allow_html=True)
     st.radio("Navigation", NAV, format_func=lambda key: NAV_LABELS[key], key="nav", label_visibility="collapsed")
     nav = st.session_state["nav"]
     st.markdown("<div class='side-label'>Your conversations</div>", unsafe_allow_html=True)
-    
-    # --- MULTI-TENANT CHAT FETCHING ---
-    raw_chats = db.list_chats(user_id=st.session_state["user_id"])
-    chat_ids = [c[0] for c in raw_chats]
-    chat_meta = {c[0]: (c[1], c[2]) for c in raw_chats}
-
     if chat_ids:
         st.radio("Chats", chat_ids, format_func=lambda chat_id: f"◉  {chat_meta[chat_id][0]}",
                  key="chat", label_visibility="collapsed")
@@ -362,7 +334,7 @@ with st.sidebar:
                 st.warning(f"File is larger than {MAX_UPLOAD_MB} MB.")
             else:
                 os.makedirs(RAW_DIR, exist_ok=True)
-                
+                # BUG FIX #7: random name (the old time-based name could collide between users)
                 file_path = os.path.join(RAW_DIR, f"upload_{uuid.uuid4().hex}.txt")
                 try:
                     with open(file_path, "wb") as handle:
@@ -370,13 +342,14 @@ with st.sidebar:
                     with st.spinner("Reading, protecting and analyzing the conversation..."):
                         info = process(file_path, chat_name.strip() or "My chat",
                                        [a.strip() for a in aliases.split(",") if a.strip()],
-                                       user_id=st.session_state["user_id"])
+                                       user_id=user_id)
                     st.session_state["_new_chat"] = info["chat_id"]
                     st.session_state["_upload_notice"] = {"stats": info["stats"], "raw_deleted": info["raw_deleted"]}
                     st.rerun()
                 except Exception as exc:
                     st.error(f"Could not process this chat: {exc}")
                 finally:
+                    # never leave the raw export behind, even if something failed half-way
                     try:
                         if os.path.exists(file_path):
                             os.remove(file_path)
@@ -387,9 +360,8 @@ with st.sidebar:
         with st.expander("🗑 Delete chat data"):
             st.warning("This permanently removes this chat and its stored data.")
             if st.button("Delete this chat", use_container_width=True, key="delete_chat"):
-                db.delete_chat(cid)
-                if "_load_chat" in globals() and hasattr(_load_chat, "clear"):
-                    _load_chat.clear()
+                db.delete_chat(cid, user_id=user_id)
+                _load_chat.clear()
                 st.session_state["_reset_chat"] = True
                 st.rerun()
 
@@ -397,18 +369,19 @@ with st.sidebar:
     synced = time.strftime("%H:%M", time.localtime(created)) if created is not None else "Unknown"
     st.markdown(f"<div class='status'><div class='pulse'></div><div><b>Workspace ready</b><br><span>Last synced {synced}</span></div></div>", unsafe_allow_html=True)
     st.caption(f"AI mode: {MODE} · Retention: {RETENTION_DAYS} days")
+
 # ---------------------------- Active chat data (loaded once) ----------------------------
 messages = {}
 items = []
 if cid:
-    messages, items, ACTIVE_ALTS = _load_chat(cid)
-chat_title = chat_meta[cid][0] if cid in chat_meta else ""   # BUG FIX #24 (see notes)
+    messages, items, ACTIVE_ALTS = _load_chat(cid, user_id)
+chat_title = chat_meta[cid][0] if cid in chat_meta else ""
 action_items = [item for item in items if item.get("kind") == "action"]
 decisions = [item for item in items if item.get("kind") == "decision"]
 high_items = [item for item in items if item.get("score", 0) >= 6]
 n_messages, n_actions, n_decisions, n_high = len(messages), len(action_items), len(decisions), len(high_items)
 
-
+# BUG FIX #9: tell the user when part of the analysis failed
 notice = st.session_state.pop("_upload_notice", None)
 if notice:
     stats = notice["stats"]
@@ -418,6 +391,8 @@ if notice:
                    f"First error: {(stats.get('errors') or ['unknown'])[0]}")
     if stats.get("rejected_by_verification"):
         st.caption(f"{stats['rejected_by_verification']} extracted item(s) were rejected because they could not be verified against the chat.")
+    if stats.get("unsupported_fields_removed"):
+        st.caption(f"{stats['unsupported_fields_removed']} assignee/deadline value(s) were removed because the cited messages did not support them.")
     if not notice.get("raw_deleted", True):
         st.warning("The raw uploaded file could not be deleted automatically. Please remove it from the data/raw folder.")
 
@@ -519,6 +494,7 @@ elif nav == "chats":
         st.markdown("<div class='section-title'>Original messages</div>", unsafe_allow_html=True)
         msg_query = st.text_input("Search this chat", placeholder="Search sender or message text...", key="message_search")
         all_messages = list(messages.values())
+        # BUG FIX #6: numeric sort (string sort gave 9, 2, 11, 100, 10, 1)
         all_messages.sort(key=lambda msg: int(msg.get("id", 0)), reverse=True)
         visible = [msg for msg in all_messages if msg_query.lower() in (str(msg.get("text", "")) + str(msg.get("sender", "")) + str(msg.get("id", ""))).lower()]
         if not visible:
@@ -526,6 +502,8 @@ elif nav == "chats":
         for msg in visible[:100]:
             mid = str(msg.get("id", ""))
             with st.expander(f"{msg.get('sender','Unknown')} · #{mid} · {msg.get('timestamp','')}", expanded=False):
+                # st.text shows the message literally (st.write would render markdown,
+                # e.g. an ![](http://tracker) image would make your browser call out)
                 st.text(msg.get("text", ""))
                 linked = [item for item in items if mid in [str(value) for value in item.get("source_message_ids", [])]]
                 if linked:
@@ -562,7 +540,7 @@ elif nav == "ask":
             submitted = st.form_submit_button("Search conversation ✦", type="primary")
     if question.strip() and (submitted or pending):
         with st.spinner("Searching messages and verifying the answer..."):
-            result = search.ask(cid, question)
+            result = search.ask(cid, question, user_id=user_id)
         verified = bool(result.get("verified"))
         if result.get("derived"):
             badge = "<span class='ok'>✔ Built from verified extracted items</span>"
@@ -605,7 +583,7 @@ elif nav == "settings":
             {"Setting": "Presidio name/place detection", "Value": "On" if USE_PRESIDIO else "Off"},
             {"Setting": "Raw upload deleted after processing", "Value": "Always (web upload)"},
             {"Setting": "Automatic retention (days)", "Value": str(RETENTION_DAYS)},
-            {"Setting": "Login password", "Value": "Enabled" if APP_PASSWORD else "Not set"},
+            {"Setting": "Accounts", "Value": "Username + password (scrypt-hashed), 5 failed logins = 5 min lock"},
         ]), hide_index=True, use_container_width=True)
     with scoring_tab:
         st.markdown("<div class='section-title'>Importance scoring weights</div>", unsafe_allow_html=True)
@@ -620,7 +598,7 @@ elif nav == "settings":
 # ---------------------------- Extraction & evaluation ----------------------------
 elif nav == "evaluation":
     page_header("Extraction & Evaluation", "Review available extraction data and source-validation status")
-
+    # Do not fabricate benchmark metrics: run `python evaluation/evaluate.py` for P/R/F1 on labeled data.
     total_items = len(items)
     sourced_items = sum(1 for item in items if item.get("source_message_ids") and any(mid in messages for mid in item.get("source_message_ids", [])))
     source_coverage = sourced_items / total_items if total_items else 0.0
@@ -652,6 +630,7 @@ elif nav == "evaluation":
         ]), hide_index=True, use_container_width=True)
         st.warning("Precision, recall, and F1 need hand-labeled ground truth. Run `python evaluation/evaluate.py` to compute them.")
 
+# URL may lag after a sidebar radio change during the first rerun; keep URL synced.
 if st.session_state.get("nav", "home") != st.query_params.get("page", "home"):
     current = st.session_state["nav"]
     if current == "home":

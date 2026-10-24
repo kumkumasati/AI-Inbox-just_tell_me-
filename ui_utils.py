@@ -1,10 +1,11 @@
+"""Small HTML helpers used by app.py (kept free of Streamlit so they can be unit-tested)."""
 import html
 import re
 
+from privacy import KINDS
+
 _ELLIPSIS = re.compile(r"\.\.\.|\u2026")
-_PLACEHOLDER = re.compile(
-    r"(\b(?:PERSON|PLACE|PHONE|LINK|EMAIL|PAN|AADHAAR|BANK|OTP)_\d+\b|(?<![\w-])ME(?![\w-]))"
-)
+_PLACEHOLDER = re.compile(rf"(\b(?:{'|'.join(KINDS)})_\d+\b|(?<![\w-])ME(?![\w-]))")
 
 def esc(value):
     return html.escape(str(value)).replace("\n", "<br>")
@@ -32,7 +33,7 @@ def _placeholder_patterns(fragment_safe, alternatives=None):
     alternatives = alternatives or {}
     parts = _PLACEHOLDER.split(fragment_safe)
     literal = "".join(parts[0::2])
-    if not re.search(r"\w", literal):       
+    if not re.search(r"\w", literal):          # only placeholders, e.g. just "ME": would match anything
         return []
     patterns, seen = [], set()
     for words in (1, 2, 3):
@@ -47,11 +48,11 @@ def _placeholder_patterns(fragment_safe, alternatives=None):
             if options:
                 ordered = sorted(options, key=len, reverse=True)
                 regex += "(?:" + "|".join(re.escape(html.escape(o)) for o in ordered) + ")"
-            elif kind in ("PHONE", "AADHAAR", "BANK", "OTP"):
+            elif kind in ("PHONE", "AADHAAR", "BANK", "OTP", "CARD"):
                 regex += r"[+\d][\d \-]*\d"
             elif kind in ("EMAIL", "LINK", "PAN"):
                 regex += r"\S+"
-            else:                              
+            else:                                   # PERSON, PLACE, ME (unknown)
                 regex += name
         if regex not in seen:
             seen.add(regex)
